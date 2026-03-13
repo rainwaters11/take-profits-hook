@@ -148,3 +148,45 @@ When do these tick values change? Swaps
 3. We're not going to support pools that have native ETH token as one of the currencies. We only support ERC20-ERC20 pools.
 
 https://atriumacademy.typeform.com/to/Z7Ad4he
+
+---
+
+## UHI Project Highlights
+
+**Course:** Uniswap Hook Incubator (UHI) Cohort 8 — Limit Order / Take Profits Hook
+
+### What was built
+
+A fully on-chain take-profit limit order book implemented as a Uniswap v4 hook. Users place orders specifying a tick price at which to sell a token; the hook autonomously executes those orders inside `afterSwap` whenever a real swap moves the pool price through the target tick range.
+
+### Key technical decisions
+
+| Feature | Implementation |
+|---|---|
+| **Order placement** | ERC-1155 receipt tokens minted 1:1 for `inputAmount`; fully transferable and proportional on redemption |
+| **Order execution trigger** | `afterSwap` scans the tick range `[lastTick, currentTick]` each swap and executes all filled orders via internal `poolManager.swap()` |
+| **Price bounce handling** | `while(tryMore)` loop re-queries `poolManager.getSlot0` after every internal execution so price movements caused by order fills are accounted for |
+| **Re-entrancy guard** | EIP-1153 transient storage (`tstore`/`tload`) — `EXECUTING_ORDER_SLOT` derived as `keccak256("TakeProfitsHook.executingOrder") - 1`; armed before `poolManager.swap()`, disarmed after |
+| **Token accounting** | Canonical v4 singleton pattern: `sync` → `transfer` → `settle` for debits; `poolManager.take` for credits |
+| **ERC20 safety** | `SafeERC20.safeTransferFrom` in `placeOrder` to handle non-standard tokens |
+| **Hook permissions** | `afterInitialize` (seed `lastTick`) + `afterSwap` (execute orders); address mined with `AFTER_INITIALIZE_FLAG \| AFTER_SWAP_FLAG` |
+
+### Test results
+
+```
+forge test -vvv
+Ran 6 tests for test/TakeProfitshook.t.sol:TakeProfitsHookTest
+[PASS] test_placeOrder()                              (gas: 134,974)
+[PASS] test_cancelOrder()                             (gas: 115,712)
+[PASS] test_orderExecute_zeroForOne()                 (gas: 328,676)
+[PASS] test_orderExecute_oneForZero()                 (gas: 1,031,331)
+[PASS] test_multiple_orderExecute_zeroForOne_onlyOne()(gas: 450,324)
+[PASS] test_multiple_orderExecute_zeroForOne_both()   (gas: 511,716)
+6 passed, 0 failed
+```
+
+### Standards compliance
+
+- Solidity `^0.8.26`, EVM Cancun (`evm_version = "cancun"` for EIP-1153 `tstore`/`tload`)
+- `forge build` completes with **zero errors, zero warnings**
+- No `console.log` statements in production code
