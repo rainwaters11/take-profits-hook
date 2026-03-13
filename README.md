@@ -1,3 +1,35 @@
+# Take Profit Limit Order Hook
+
+## 🚀 **UHI Project Highlights**
+
+### **🛠️ Technical Improvements (UHI Implementation)**
+
+In completing this limit order hook, I upgraded the reference logic to meet **2026 production standards**:
+
+* **🔒 EIP-1153 Integration:** Implemented a gas-efficient recursion guard using **Transient Storage** (`tstore`/`tload`) to prevent re-entrancy during internal swaps.
+* **🏦 Advanced Accounting:** Refactored the settlement logic to utilize the **Singleton pattern** with `PoolManager.settle()` and `PoolManager.take()`.
+* **🛡️ Safe Execution:** Integrated `SafeERC20` to ensure robust compatibility with non-standard tokens.
+* **🧪 Full Test Coverage:** Verified the "Price Bounce" logic and multi-order fulfillment with a comprehensive **Foundry test suite**.
+
+---
+
+## 📝 **Implementation Details**
+
+### **The Fulfillment Loop**
+The hook implements a dynamic `while` loop within `afterSwap`. This ensures that if the execution of one limit order shifts the price significantly, the hook re-evaluates the new current tick before attempting to fill subsequent orders.
+
+### **Recursive Safety**
+By using the `EXECUTING_ORDER_SLOT` in transient storage, the hook safely identifies when a swap is being triggered by its own logic, effectively preventing infinite recursion without the gas overhead of traditional state-variable guards.
+
+---
+
+## 🛠️ **Installation & Testing**
+
+### **Build**
+```bash
+forge build --via-ir
+
+
 # Limit Orders - Part 1
 
 Limit Order based hook - how can we create a hook that behaves like a simepl orderbook on chain
