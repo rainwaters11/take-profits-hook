@@ -14,15 +14,31 @@ import {Currency} from "v4-core/types/Currency.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
+// BeforeSwapDelta is imported to signal readiness for the NoOp beforeSwap pattern
+// (returning a BeforeSwapDelta from beforeSwap to bypass AMM execution).
+// forge-lint: disable-next-line(unused-import)
+import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapDelta.sol";
 
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 
 contract TakeProfitsHook is BaseHook, ERC1155 {
     using StateLibrary for IPoolManager;
     using FixedPointMathLib for uint256;
+    using SafeERC20 for IERC20;
+
+    // ---------------------------------------------------------------------------
+    // EIP-1153 Transient Storage – recursion guard
+    // A collision-resistant slot derived from a hook-specific string minus 1
+    // (the "- 1" trick avoids accidental overlap with Solidity storage slots).
+    // tstore/tload cost ~100 gas and auto-reset at transaction end, making them
+    // ideal for within-transaction cross-function guards.
+    // ---------------------------------------------------------------------------
+    uint256 private constant EXECUTING_ORDER_SLOT =
+        uint256(keccak256("TakeProfitsHook.executingOrder")) - 1;
 
     // Storage
     mapping(PoolId poolId => int24 lastTick) public lastTicks;
@@ -81,16 +97,22 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
     }
 
     function _afterSwap(
-        address sender,
+        address,
         PoolKey calldata key,
         SwapParams calldata params,
         BalanceDelta,
         bytes calldata
     ) internal override returns (bytes4, int128) {
-        // `sender` is the address which initiated the swap
-        // if `sender` is the hook, we don't want to go down the `afterSwap`
-        // rabbit hole again
-        if (sender == address(this)) return (this.afterSwap.selector, 0);
+        // EIP-1153 recursion guard (tload is ~100 gas, resets automatically at
+        // transaction end). When this hook executes an internal order swap via
+        // swapAndSettleBalances(), that nested swap triggers afterSwap again.
+        // The guard ensures we return immediately instead of recursing.
+        bool executing;
+        uint256 _guardSlot = EXECUTING_ORDER_SLOT;
+        assembly ("memory-safe") {
+            executing := tload(_guardSlot)
+        }
+        if (executing) return (this.afterSwap.selector, 0);
 
         // Should we try to find and execute orders? True initially
         bool tryMore = true;
@@ -138,11 +160,12 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         _mint(msg.sender, orderId, inputAmount, "");
 
         // Depending on direction of swap, we select the proper input token
-        // and request a transfer of those tokens to the hook contract
+        // and request a transfer of those tokens to the hook contract.
+        // safeTransferFrom handles non-standard ERC20s that do not return bool.
         address sellToken = zeroForOne
             ? Currency.unwrap(key.currency0)
             : Currency.unwrap(key.currency1);
-        IERC20(sellToken).transferFrom(msg.sender, address(this), inputAmount);
+        IERC20(sellToken).safeTransferFrom(msg.sender, address(this), inputAmount);
 
         // Return the tick at which the order was actually placed
         return tick;
@@ -297,13 +320,20 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         bool zeroForOne,
         uint256 inputAmount
     ) internal {
-        // Do the actual swap and settle all balances
+        // Safe downcast: inputAmount must fit in int256 (amounts this large are
+        // economically implausible, but we guard explicitly).
+        require(inputAmount <= uint256(type(int256).max), "amount overflow");
+
+        // Do the actual swap and settle all balances.
+        // The cast is safe because of the require above.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        int256 amountSpecified = -int256(inputAmount);
         BalanceDelta delta = swapAndSettleBalances(
             key,
             SwapParams({
                 zeroForOne: zeroForOne,
-                // We provide a negative value here to signify an "exact input for output" swap
-                amountSpecified: -int256(inputAmount),
+                // Negative value => exact-input-for-output swap
+                amountSpecified: amountSpecified,
                 // No slippage limits (maximum slippage possible)
                 sqrtPriceLimitX96: zeroForOne
                     ? TickMath.MIN_SQRT_PRICE + 1
@@ -326,8 +356,21 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         PoolKey calldata key,
         SwapParams memory params
     ) internal returns (BalanceDelta) {
-        // Conduct the swap inside the Pool Manager
+        // Arm the EIP-1153 recursion guard immediately before the internal swap.
+        // The nested afterSwap callback will see executing == true and return
+        // (afterSwap.selector, 0) without recursing into tryExecutingOrders.
+        // tstore is automatically reverted if the swap reverts, so no cleanup
+        // is necessary on the error path.
+        uint256 _guardSlot = EXECUTING_ORDER_SLOT;
+        assembly ("memory-safe") {
+            tstore(_guardSlot, 1)
+        }
         BalanceDelta delta = poolManager.swap(key, params, "");
+        // Disarm the guard now that the internal swap (and its afterSwap hook)
+        // have completed. Settle / take calls below do not trigger afterSwap.
+        assembly ("memory-safe") {
+            tstore(_guardSlot, 0)
+        }
 
         // If we just did a zeroForOne swap
         // We need to send Token 0 to PM, and receive Token 1 from PM
